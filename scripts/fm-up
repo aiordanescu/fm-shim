@@ -1,0 +1,61 @@
+#!/bin/zsh
+# fm-up: start Apple's `fm serve` and fm-shim together, and stop both together.
+#
+# Run it from Terminal.app: `fm serve` only offers Private Cloud Compute (model "pcc")
+# when Terminal started it. Ctrl+C (or closing the window) stops both.
+#
+# Settings (environment variables):
+#   FM_PORT      port for `fm serve`              (default 1977)
+#   SHIM_PORT    port clients connect to          (default 1976)
+#   FM_SHIM      path to the fm-shim binary       (default: fm-shim on PATH, then ~/.cargo/bin)
+#   FM_SHIM_LOG  request log, trimmed on start    (default ~/Library/Logs/fm-shim.log)
+#
+# Point clients at http://127.0.0.1:$SHIM_PORT/v1, model "system" or "pcc".
+set -u
+FM_PORT=${FM_PORT:-1977}
+SHIM_PORT=${SHIM_PORT:-1976}
+LOG=${FM_SHIM_LOG:-$HOME/Library/Logs/fm-shim.log}
+LOG_KEEP_LINES=2000
+
+die() { echo "fm-up: $*" >&2; exit 1; }
+
+[[ -x /usr/bin/fm ]] || die "/usr/bin/fm not found; it ships with macOS 27.2 and later"
+
+SHIM=${FM_SHIM:-$(command -v fm-shim 2>/dev/null || true)}
+[[ -z $SHIM && -x $HOME/.cargo/bin/fm-shim ]] && SHIM=$HOME/.cargo/bin/fm-shim
+[[ -n $SHIM && -x $SHIM ]] || die "fm-shim not found; install it with: cargo install --git https://github.com/aiordanescu/fm-shim"
+
+for port in $FM_PORT $SHIM_PORT; do
+  lsof -nP -iTCP:$port -sTCP:LISTEN >/dev/null 2>&1 && die "port $port is already in use (is fm-up already running?)"
+done
+
+if [[ ${TERM_PROGRAM:-} != Apple_Terminal ]]; then
+  echo "fm-up: note: not running in Terminal.app, so model \"pcc\" will be unavailable (\"system\" still works)"
+fi
+
+mkdir -p "${LOG:h}"
+if [[ -f $LOG ]] && (( $(wc -l < "$LOG") > LOG_KEEP_LINES )); then
+  tail -n $LOG_KEEP_LINES "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+
+/usr/bin/fm serve --port $FM_PORT &
+FM_PID=$!
+"$SHIM" --listen $SHIM_PORT --upstream $FM_PORT --log "$LOG" &
+SHIM_PID=$!
+
+stop() { kill $FM_PID $SHIM_PID 2>/dev/null; wait 2>/dev/null; echo "fm-up: stopped"; exit 0; }
+trap stop INT TERM HUP
+
+# fm-shim answers 502 until fm serve is ready, so wait for a 200.
+for _ in {1..20}; do
+  curl -sf -m 2 "http://127.0.0.1:$SHIM_PORT/health" >/dev/null 2>&1 && break
+  sleep 1
+done
+echo "fm-up: fm serve on :$FM_PORT, fm-shim on :$SHIM_PORT (log: $LOG)"
+curl -s -m 3 "http://127.0.0.1:$SHIM_PORT/health"; echo
+echo "fm-up: Ctrl+C or close this window to stop."
+
+# If either process exits, stop the other so nothing is left half-running.
+while kill -0 $FM_PID 2>/dev/null && kill -0 $SHIM_PID 2>/dev/null; do sleep 5; done
+echo "fm-up: one of the processes exited; stopping the other."
+stop

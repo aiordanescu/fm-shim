@@ -51,6 +51,24 @@ started it; from launchd, ssh, IDE terminals or other apps it reports
 "Private Cloud Compute is not available in this context." `system` works from
 anywhere.
 
+The easiest way is [`scripts/fm-up`](scripts/fm-up), which starts both, waits
+until they're ready, and stops both together on Ctrl+C, when the window closes,
+or if either one exits:
+
+```sh
+curl -fsSL -o ~/.local/bin/fm-up https://raw.githubusercontent.com/aiordanescu/fm-shim/master/scripts/fm-up
+chmod +x ~/.local/bin/fm-up
+fm-up
+```
+
+Its ports and log location can be changed with environment variables; see the
+top of the script. To start it at login, put
+[`scripts/fm-up.command`](scripts/fm-up.command) next to it and add the
+`.command` file under System Settings → General → Login Items. macOS opens
+`.command` files in Terminal.app, so `pcc` works. Leave the window open.
+
+Or start the two yourself:
+
 ```sh
 fm serve --port 1977 &
 fm-shim --listen 1976 --upstream 1977
