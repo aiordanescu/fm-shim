@@ -28,6 +28,14 @@ Most agent clients trip over at least one of these:
 | `reasoning_effort` `minimal` on `pcc` | `low` |
 | any other `reasoning_effort` it doesn't accept (anything on `system`; `none`, `xhigh`, etc. on `pcc`) | the field is dropped |
 
+It also fixes one response. `fm serve` reports a context overflow as a generic
+server error with no numbers ("The session's transcript exceeded the model's
+context size."): an HTTP 500, or an `event: error` inside a 200 stream.
+fm-shim rewrites it to OpenAI's `context_length_exceeded` error, quoting the
+model's window (32,768 tokens for `pcc`, 4,096 for `system`), and sends the
+non-streamed form as HTTP 400. Clients that compress on overflow, like Hermes
+Agent, can then recover instead of failing the turn.
+
 Everything else passes through untouched, and responses (including streams)
 are relayed as they arrive.
 

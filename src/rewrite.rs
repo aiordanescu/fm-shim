@@ -10,8 +10,23 @@
 //! - `developer` messages are sent as `system`;
 //! - `reasoning_effort` is mapped or dropped: only model `pcc` accepts it, and
 //!   only `low` / `medium` / `high` (`minimal` becomes `low`).
+//!
+//! It also fixes one response: `fm serve` reports a context overflow as a
+//! generic server error with no numbers ("The session's transcript exceeded
+//! the model's context size."), which clients can't act on. It's rewritten to
+//! OpenAI's `context_length_exceeded` error, quoting the model's window, so
+//! clients that compress on overflow can recover.
 
 use serde_json::{Map, Value};
+
+/// Context windows `fm serve` enforces, per model.
+pub fn context_window(model: &str) -> Option<u32> {
+    match model {
+        "pcc" => Some(32768),
+        "system" => Some(4096),
+        _ => None,
+    }
+}
 
 /// Keys kept from the parent object when a union is replaced by one branch.
 const KEEP_FROM_PARENT: [&str; 3] = ["description", "title", "default"];
@@ -27,6 +42,8 @@ pub struct Rewrite {
     pub summary: Option<String>,
     /// What was changed, one entry per change.
     pub notes: Vec<String>,
+    /// The request's `model`, if it had one.
+    pub model: Option<String>,
 }
 
 pub fn rewrite(body: &[u8]) -> Rewrite {
@@ -37,6 +54,7 @@ pub fn rewrite(body: &[u8]) -> Rewrite {
                 body: body.to_vec(),
                 summary: None,
                 notes: Vec::new(),
+                model: None,
             };
         }
     };
@@ -120,7 +138,63 @@ pub fn rewrite(body: &[u8]) -> Rewrite {
         body,
         summary: Some(summary),
         notes,
+        model,
     }
+}
+
+/// If `message` is `fm serve`'s context-overflow error, the OpenAI-style message to send instead.
+fn overflow_message(message: &str, model: Option<&str>) -> Option<String> {
+    let lower = message.to_lowercase();
+    let is_overflow = lower.contains("context size") || lower.contains("maximum allowed");
+    if !is_overflow || lower.contains("maximum context length is") {
+        return None;
+    }
+    Some(match model.and_then(context_window) {
+        Some(n) => format!(
+            "This model's maximum context length is {n} tokens. However, your messages resulted in \
+             more tokens than that. Please reduce the length of the messages. (fm serve: {message})"
+        ),
+        None => format!(
+            "This model's maximum context length was exceeded. Please reduce the length of the \
+             messages. (fm serve: {message})"
+        ),
+    })
+}
+
+/// Rewrite an `{"error": {...}}` body if it reports a context overflow; `None` if it doesn't.
+pub fn rewrite_overflow_error(body: &[u8], model: Option<&str>) -> Option<Vec<u8>> {
+    let mut doc: Value = serde_json::from_slice(body).ok()?;
+    let err = doc.get_mut("error")?.as_object_mut()?;
+    let message = overflow_message(err.get("message")?.as_str()?, model)?;
+    err.insert("message".into(), Value::from(message));
+    err.insert("type".into(), Value::from("invalid_request_error"));
+    err.insert("code".into(), Value::from("context_length_exceeded"));
+    err.insert("param".into(), Value::from("messages"));
+    Some(serde_json::to_vec(&doc).expect("serializing a JSON value can't fail"))
+}
+
+/// Rewrite complete SSE lines (each ending in `\n`): a `data:` line carrying a context-overflow
+/// error gets the OpenAI-style error; everything else is copied. Returns the new bytes and
+/// whether anything changed.
+pub fn rewrite_sse_lines(lines: &[u8], model: Option<&str>) -> (Vec<u8>, bool) {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut changed = false;
+    for line in lines.split_inclusive(|&b| b == b'\n') {
+        let replaced = line
+            .strip_prefix(b"data:")
+            .filter(|rest| rest.windows(7).any(|w| w == b"\"error\""))
+            .and_then(|rest| rewrite_overflow_error(rest.trim_ascii(), model));
+        match replaced {
+            Some(body) => {
+                out.extend_from_slice(b"data: ");
+                out.extend_from_slice(&body);
+                out.push(b'\n');
+                changed = true;
+            }
+            None => out.extend_from_slice(line),
+        }
+    }
+    (out, changed)
 }
 
 /// Collapse JSON Schema unions under `node`, recording each change in `notes`.
@@ -241,6 +315,46 @@ fn repr(v: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    const FM_OVERFLOW: &str = r#"{"error":{"message":"The session's transcript exceeded the model's context size.","type":"server_error","code":"500"}}"#;
+
+    #[test]
+    fn overflow_error_becomes_context_length_exceeded() {
+        let out: Value = serde_json::from_slice(
+            &rewrite_overflow_error(FM_OVERFLOW.as_bytes(), Some("pcc")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["error"]["code"], "context_length_exceeded");
+        assert_eq!(out["error"]["type"], "invalid_request_error");
+        let msg = out["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.starts_with("This model's maximum context length is 32768 tokens."),
+            "{msg}"
+        );
+        // Already rewritten, and unrelated errors, are left alone.
+        assert!(rewrite_overflow_error(msg.as_bytes(), Some("pcc")).is_none());
+        let other = r#"{"error":{"message":"Invalid request: bad format","code":"400"}}"#;
+        assert!(rewrite_overflow_error(other.as_bytes(), Some("pcc")).is_none());
+    }
+
+    #[test]
+    fn overflow_in_sse_stream_is_rewritten_in_place() {
+        let stream = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}}}}]}}\n\nevent: error\ndata: {FM_OVERFLOW}\n\n"
+        );
+        let (out, changed) = rewrite_sse_lines(stream.as_bytes(), Some("system"));
+        let out = String::from_utf8(out).unwrap();
+        assert!(changed);
+        assert!(out.starts_with("data: {\"choices\""));
+        assert!(out.contains("event: error\ndata: {"));
+        assert!(out.contains("maximum context length is 4096 tokens"));
+        assert!(out.ends_with("\n\n"));
+        let plain = "data: {\"choices\":[]}\n\n";
+        assert_eq!(
+            rewrite_sse_lines(plain.as_bytes(), Some("pcc")),
+            (plain.as_bytes().to_vec(), false)
+        );
+    }
 
     fn run(v: Value) -> (Value, Rewrite) {
         let r = rewrite(&serde_json::to_vec(&v).unwrap());

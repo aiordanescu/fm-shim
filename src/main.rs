@@ -146,9 +146,11 @@ async fn handle(req: Request<Incoming>, st: Arc<State>) -> Result<Response<Body>
         }
     };
     let is_chat = parts.uri.path().ends_with("/chat/completions");
+    let mut model: Option<String> = None;
 
     let body = if is_chat && !body.is_empty() {
         let r = rewrite::rewrite(&body);
+        model = r.model.clone();
         if let Some(summary) = &r.summary {
             st.log.line(summary);
         }
@@ -201,13 +203,58 @@ async fn handle(req: Request<Incoming>, st: Arc<State>) -> Result<Response<Body>
 
     let status = resp.status();
     let (rparts, mut rbody) = resp.into_parts();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(16);
+    let is_sse = rparts
+        .headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/event-stream"));
 
-    // Stream the upstream body through unchanged, then log one line about it.
+    // A non-streamed context overflow arrives as a 500: answer with OpenAI's 400 instead.
+    if is_chat && status == StatusCode::INTERNAL_SERVER_ERROR && !is_sse {
+        let body = rbody
+            .collect()
+            .await
+            .map(|c| c.to_bytes())
+            .unwrap_or_default();
+        if let Some(new) = rewrite::rewrite_overflow_error(&body, model.as_deref()) {
+            st.log.line(&format!(
+                "  -> 500 context overflow, sent as 400 context_length_exceeded total={:.1}s",
+                t0.elapsed().as_secs_f64()
+            ));
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from(new)).boxed())
+                .expect("static response parts are valid"));
+        }
+        let head = String::from_utf8_lossy(&body[..body.len().min(300)]).into_owned();
+        st.log.line(&format!(
+            "  -> 500 total={:.1}s bytes={} {head}",
+            t0.elapsed().as_secs_f64(),
+            body.len()
+        ));
+        let mut out = Response::builder().status(status);
+        for (k, v) in &rparts.headers {
+            if !DROP_RESPONSE_HEADERS.contains(&k.as_str()) {
+                out = out.header(k, v);
+            }
+        }
+        return Ok(out.body(Full::new(body).boxed()).unwrap_or_else(|e| {
+            error_response(StatusCode::BAD_GATEWAY, &format!("building response: {e}"))
+        }));
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(16);
+    let rewrite_stream = is_chat && is_sse;
+
+    // Stream the upstream body through, then log one line about it. Event streams are
+    // forwarded line by line so a context-overflow error event can be rewritten.
     tokio::spawn(async move {
         let mut first_byte = None;
         let mut total = 0usize;
         let mut head = Vec::new();
+        let mut pending: Vec<u8> = Vec::new();
+        let mut overflow = false;
         while let Some(frame) = rbody.frame().await {
             let frame = match frame {
                 Ok(f) => f,
@@ -216,16 +263,41 @@ async fn handle(req: Request<Incoming>, st: Arc<State>) -> Result<Response<Body>
                     break;
                 }
             };
-            if let Some(data) = frame.data_ref() {
-                first_byte.get_or_insert_with(|| t0.elapsed().as_secs_f64());
-                total += data.len();
-                if status.as_u16() >= 400 && head.len() < 500 {
-                    head.extend_from_slice(data);
+            let frame = match frame.data_ref() {
+                Some(data) => {
+                    first_byte.get_or_insert_with(|| t0.elapsed().as_secs_f64());
+                    total += data.len();
+                    if status.as_u16() >= 400 && head.len() < 500 {
+                        head.extend_from_slice(data);
+                    }
+                    if !rewrite_stream {
+                        frame
+                    } else {
+                        pending.extend_from_slice(data);
+                        let Some(end) = pending.iter().rposition(|&b| b == b'\n') else {
+                            continue; // no complete line yet
+                        };
+                        let rest = pending.split_off(end + 1);
+                        let ready = std::mem::replace(&mut pending, rest);
+                        let (out, changed) = rewrite::rewrite_sse_lines(&ready, model.as_deref());
+                        overflow |= changed;
+                        Frame::data(Bytes::from(out))
+                    }
                 }
-            }
+                None => frame,
+            };
             if tx.send(Ok(frame)).await.is_err() {
                 break; // client went away
             }
+        }
+        if !pending.is_empty() {
+            let (out, changed) = rewrite::rewrite_sse_lines(&pending, model.as_deref());
+            overflow |= changed;
+            let _ = tx.send(Ok(Frame::data(Bytes::from(out)))).await;
+        }
+        if overflow {
+            st.log
+                .line("  stream reported a context overflow, sent as context_length_exceeded");
         }
         if is_chat {
             let head = String::from_utf8_lossy(&head[..head.len().min(300)]).into_owned();

@@ -1,6 +1,6 @@
 [package]
 name = "fm-shim"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Proxy for Apple's `fm serve` that rewrites the requests it rejects (tool-schema unions, developer role, reasoning_effort)"
 license = "MIT"
